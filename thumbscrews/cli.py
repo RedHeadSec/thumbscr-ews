@@ -8,18 +8,101 @@ from hashlib import md5
 import click
 import exchangelib
 import yaml as yamllib
+import urllib3
+import requests
 from exchangelib import Account, EWSDateTime, FolderCollection, Q, Message
 from exchangelib import FileAttachment, Account, discover, BaseProtocol, Credentials, Configuration, DELEGATE
-# from exchangelib import Credentials, Account
-# from exchangelib import Account, DistributionList
-# from exchangelib import discover, BaseProtocol
+from exchangelib import Version, Build
+from exchangelib.protocol import NoVerifyHTTPAdapter
 from exchangelib.services import ResolveNames
-# This handler will pretty-print and syntax highlight the request and response XML documents
 from exchangelib.util import PrettyXmlHandler
 
 from thumbscrews.__init__ import __version__
 from thumbscrews.tbestate import tbestate
 
+# Disable SSL warnings for self-signed certificates
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+requests.packages.urllib3.disable_warnings()
+
+def create_safe_account(username, credentials, exch_host=None, access_type=DELEGATE):
+    """
+    Create Exchange account with SSL bypass and proper version handling
+    """
+    # Disable SSL verification for self-signed certificates in test environments
+    BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
+    
+    try:
+        if exch_host:
+            # Try with common Exchange versions when using explicit host
+            exchange_versions = [
+                Version(build=Build(15, 2, 1544)),  # Exchange 2019
+                Version(build=Build(15, 1, 2507)),  # Exchange 2016 CU23
+                Version(build=Build(15, 1, 2308)),  # Exchange 2016 CU22
+                Version(build=Build(15, 0, 1497)),  # Exchange 2013
+                Version(build=Build(14, 3, 496)),   # Exchange 2010
+            ]
+            
+            for version in exchange_versions:
+                try:
+                    config = Configuration(
+                        server=exch_host, 
+                        credentials=credentials, 
+                        version=version,
+                        retry_policy=None  # Disable retries for faster failure
+                    )
+                    account = Account(username, config=config, autodiscover=False, access_type=access_type)
+                    
+                    # Test the account by accessing basic properties
+                    _ = account.protocol.version
+                    return account
+                    
+                except Exception:
+                    continue
+            
+            # If all versions fail, try without explicit version (let exchangelib auto-detect)
+            config = Configuration(server=exch_host, credentials=credentials)
+            account = Account(username, config=config, autodiscover=False, access_type=access_type)
+            return account
+            
+        else:
+            # Use autodiscover when no explicit host
+            account = Account(username, credentials=credentials, autodiscover=True, access_type=access_type)
+            return account
+            
+    except Exception as e:
+        # Final fallback - try Exchange 2016 with basic config
+        if exch_host:
+            try:
+                version = Version(build=Build(15, 1, 2308))
+                config = Configuration(server=exch_host, credentials=credentials, version=version)
+                account = Account(username, config=config, autodiscover=False, access_type=access_type)
+                return account
+            except:
+                pass
+        raise e
+
+def safe_resolve_names(account, entry, return_full_contact_data=False):
+    """
+    Safely call ResolveNames with proper error handling for version issues
+    """
+    try:
+        # Check if protocol has proper version
+        if not hasattr(account.protocol, 'version') or account.protocol.version is None:
+            raise AttributeError("Protocol version not properly initialized")
+            
+        return list(ResolveNames(account.protocol).call(
+            unresolved_entries=(entry,),
+            return_full_contact_data=return_full_contact_data
+        ))
+        
+    except AttributeError as e:
+        if "'NoneType' object has no attribute 'api_version'" in str(e):
+            click.secho(f'[!] Version detection failed for entry: {entry}', fg='yellow', dim=True)
+            return []
+        raise
+    except Exception as e:
+        click.secho(f'[!] Error resolving {entry}: {e}', fg='red', dim=True)
+        return []
 
 @click.group()
 @click.option('--config', '-C', type=click.Path(exists=True), help='Path to an optional configuration file.')
@@ -28,7 +111,6 @@ from thumbscrews.tbestate import tbestate
 @click.option('--user-agent', '-a', help='The User-Agent to use (Otherwise uses "thumbscr-ews/0.0.1").')
 @click.option('--outlook-agent', '-o', is_flag=True,
               help='Set the User-Agent to an Outlook one (this is still a static value that can be fingerprinted).')
-# @click.option('--exchange', '-e', help='The exchange endpoint to use. eg: https://outlook.office365.com/EWS/Exchange.asmx')
 @click.option('--dump-config', is_flag=True, help='Dump the effective configuration used.')
 @click.option('--exch-host', help='If you dont want to try autodicover set the exchange host.')
 @click.option('--verbose', '-v', is_flag=True, help="Enables debugging information.")
@@ -39,8 +121,6 @@ def cli(config, username, password, dump_config, verbose, user_agent, outlook_ag
         thumsc-ews for Exchange Web Services
             by @_cablethief from @sensepost of @orangecyberdef
     """
-    # logging.basicConfig(level=logging.WARNING)
-
     if verbose:
         logging.basicConfig(level=logging.DEBUG, handlers=[PrettyXmlHandler()])
 
@@ -83,7 +163,6 @@ def version():
     """
         Prints the current thumbsc-ews version
     """
-
     click.secho(f'thumbsc-ews version {__version__}')
 
 
@@ -94,7 +173,6 @@ def yaml(destination):
     """
         Generate an example YAML configuration file
     """
-
     # Don't be a douche and override an existing configuration
     if os.path.exists(destination):
         click.secho(
@@ -131,7 +209,6 @@ def autodiscover(verbose):
     """
         Authenticate and go through autodiscover.
     """
-
     try:
         tbestate.validate(['username', 'password'])
         credentials = Credentials(tbestate.username, tbestate.password)
@@ -139,6 +216,9 @@ def autodiscover(verbose):
         if verbose:
             logging.basicConfig(level=logging.DEBUG, handlers=[PrettyXmlHandler()])
 
+        # Disable SSL verification for autodiscover in test environments
+        BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
+        
         primary_address, protocol = discover(tbestate.username, credentials=credentials)
 
         click.secho(f'Autodiscover results:', bold=True, fg='yellow')
@@ -153,7 +233,6 @@ def mail():
     """
         Do things with emails.
     """
-
     pass
 
 
@@ -174,7 +253,6 @@ def read(search, html, limit, folder, id, delegate):
         If you give it a folder without mail objects you may be sad.
         Check the objects command for just printing out what the library gives us.
     """
-
     credentials = Credentials(tbestate.username, tbestate.password)
 
     if delegate:
@@ -183,11 +261,7 @@ def read(search, html, limit, folder, id, delegate):
         username = tbestate.username
     
     try:
-        if tbestate.exch_host:
-            config = Configuration(server=tbestate.exch_host, credentials=credentials)
-            account = Account(username, config=config, autodiscover=False, access_type=DELEGATE)
-        else:
-            account = Account(username, credentials=credentials, autodiscover=True, access_type=DELEGATE)
+        account = create_safe_account(username, credentials, tbestate.exch_host, DELEGATE)
     except exchangelib.errors.ErrorNonExistentMailbox as neb:
         print(f'[!] Mailbox does not exist for user: {username}')
         exit()
@@ -205,22 +279,18 @@ def read(search, html, limit, folder, id, delegate):
         exit()
     except Exception as err:
         print(f'[!] Something went wrong: {err}')
-
+        exit()
 
     if folder:
-        # pylint: disable=maybe-no-member
         current_folder = account.root.glob(folder)
     else:
         current_folder = account.inbox
 
     if search:
-        # mails = account.inbox.filter(Q(body__icontains=search) | Q(subject__icontains=search))
-        # mails = account.inbox.filter(Q(body__icontains=search))
         mails = current_folder.filter(search).order_by('-datetime_received')
     else:
         if id:
-            mails = [current_folder.get(
-                id=id)]
+            mails = [current_folder.get(id=id)]
         else:
             mails = current_folder.all().order_by('-datetime_received')[:limit]
 
@@ -230,7 +300,6 @@ def read(search, html, limit, folder, id, delegate):
             click.secho(f'Sender: {item.sender}', fg='bright_cyan')
             click.secho(f'ReceivedBy: {item.received_by}', fg='cyan')
             click.secho(f'ID: {item.id}\n', fg='bright_magenta')
-            # click.secho(f'{item.datetime_received}', fg='green', bold=True)
             if html:
                 click.secho(f'Body:\n\n{item.body}\n', fg='white')
             else:
@@ -260,9 +329,7 @@ def getattachments(id, folder, path, search, limit, delegate):
     """
         Download all the attachments from a Mail
     """
-
-    credentials = Credentials(
-        tbestate.username, tbestate.password)
+    credentials = Credentials(tbestate.username, tbestate.password)
 
     if delegate:
         username = delegate
@@ -270,14 +337,7 @@ def getattachments(id, folder, path, search, limit, delegate):
         username = tbestate.username
 
     try:
-
-        if tbestate.exch_host:
-            config = Configuration(server=tbestate.exch_host, credentials=credentials)
-            account = Account(username,
-                              config=config, autodiscover=False, access_type=DELEGATE)
-        else:
-            account = Account(username, credentials=credentials, autodiscover=True, access_type=DELEGATE)
-
+        account = create_safe_account(username, credentials, tbestate.exch_host, DELEGATE)
     except exchangelib.errors.ErrorNonExistentMailbox as neb:
         print(f'[!] Mailbox does not exist for user: {username}')
         exit()
@@ -295,16 +355,14 @@ def getattachments(id, folder, path, search, limit, delegate):
         exit()
     except Exception as err:
         print(f'[!] Something went wrong: {err}')
+        exit()
 
     if folder:
-        # pylint: disable=maybe-no-member
         current_folder = account.root.glob(folder)
     else:
         current_folder = account.inbox
 
     if search:
-        # mails = account.inbox.filter(Q(body__icontains=search) | Q(subject__icontains=search))
-        # mails = account.inbox.filter(Q(body__icontains=search))
         mails = current_folder.filter(search).order_by('-datetime_received')
     else:
         if id:
@@ -343,14 +401,11 @@ def getattachments(id, folder, path, search, limit, delegate):
 @cli.command()
 @click.option('--search', '-s', help='Search pattern to glob on. eg "Top of Information Store*"')
 @click.option('--delegate', '-d', help='Read a different persons mailbox you have access to')
-# @click.option('--html', is_flag=True, help='Retrieve the HTML version of mails, default is text.')
-# @click.option('--limit', '-l', type=click.INT, help='Limit the results returned to the most recent <amount>')
 def folders(search, delegate):
     """
         Print exchange file structure.
     """
-    credentials = Credentials(
-        tbestate.username, tbestate.password)
+    credentials = Credentials(tbestate.username, tbestate.password)
 
     if delegate:
         username = delegate
@@ -358,11 +413,7 @@ def folders(search, delegate):
         username = tbestate.username
 
     try:
-        if tbestate.exch_host:
-            config = Configuration(server=tbestate.exch_host, credentials=credentials)
-            account = Account(username, config=config, autodiscover=False, access_type=DELEGATE)
-        else:
-            account = Account(username, credentials=credentials, autodiscover=True, access_type=DELEGATE)
+        account = create_safe_account(username, credentials, tbestate.exch_host, DELEGATE)
     except exchangelib.errors.ErrorNonExistentMailbox as neb:
         print(f'[!] Mailbox does not exist for user: {username}')
         exit()
@@ -374,8 +425,8 @@ def folders(search, delegate):
         exit()
     except Exception as err:
         print(f'[!] Something went wrong: {err}')
+        exit()
 
-    # pylint: disable=maybe-no-member
     account.root.refresh()
 
     if search:
@@ -401,7 +452,6 @@ def objects(limit, folder, delegate):
         More for exploration for future features.
         Hopefully the object has a string version.
     """
-
     credentials = Credentials(tbestate.username, tbestate.password)
 
     if delegate:
@@ -410,11 +460,7 @@ def objects(limit, folder, delegate):
         username = tbestate.username
 
     try:
-        if tbestate.exch_host:
-            config = Configuration(server=tbestate.exch_host, credentials=credentials)
-            account = Account(username, config=config, autodiscover=False, access_type=DELEGATE)
-        else:
-            account = Account(username, credentials=credentials, autodiscover=True, access_type=DELEGATE)
+        account = create_safe_account(username, credentials, tbestate.exch_host, DELEGATE)
     except exchangelib.errors.ErrorNonExistentMailbox as neb:
         print(f'[!] Mailbox does not exist for user: {username}')
         exit()
@@ -426,9 +472,9 @@ def objects(limit, folder, delegate):
         exit()
     except Exception as err:
         print(f'[!] Something went wrong: {err}')
+        exit()
 
     if folder:
-        # pylint: disable=maybe-no-member
         current_folder = account.root.glob(folder)
     else:
         current_folder = account.inbox
@@ -455,7 +501,6 @@ def gal(dump, search, verbose, full, output):
         EWS only returns batches of 100
         There will be doubles, so uniq after.
     """
-
     if verbose:
         logging.basicConfig(level=logging.DEBUG, handlers=[PrettyXmlHandler()])
 
@@ -463,12 +508,7 @@ def gal(dump, search, verbose, full, output):
     username = tbestate.username
 
     try:
-        if tbestate.exch_host:
-            config = Configuration(server=tbestate.exch_host, credentials=credentials)
-            account = Account(username, config=config, autodiscover=False, access_type=DELEGATE)
-        else:
-            account = Account(username, credentials=credentials, autodiscover=True, access_type=DELEGATE)
-
+        account = create_safe_account(username, credentials, tbestate.exch_host, DELEGATE)
     except exchangelib.errors.ErrorNonExistentMailbox as neb:
         print(f'[!] Mailbox does not exist for user: {username}')
         exit()
@@ -480,12 +520,11 @@ def gal(dump, search, verbose, full, output):
         exit()
     except Exception as err:
         print(f'[!] Something went wrong: {err}')
-
-
-    atoz = [''.join(x) for x in itertools.product(string.ascii_lowercase, repeat=2)]
+        exit()
 
     if search:
-        for names in ResolveNames(account.protocol).call(unresolved_entries=(search,)):
+        names_list = safe_resolve_names(account, search)
+        for names in names_list:
             if output:
                 click.secho(f'{names}')
                 output.write(f'{names}\n')
@@ -495,28 +534,38 @@ def gal(dump, search, verbose, full, output):
     elif full:
         atoz = [''.join(x) for x in itertools.product(string.ascii_lowercase, repeat=2)]
         for entry in atoz:
-            for names in ResolveNames(account.protocol).call(unresolved_entries=(entry,), return_full_contact_data=True,):
-                stringed = str(names)
-                found = re.findall(r'[\w.+-]+@[\w-]+\.[\w.-]+', stringed)
-                for i in found:
-                    if output:
-                        click.secho(f'{i}')
-                        output.write(f'{i}\n')
-                    else:
-                        click.secho(f'{i}')
+            try:
+                names_list = safe_resolve_names(account, entry, return_full_contact_data=True)
+                for names in names_list:
+                    stringed = str(names)
+                    found = re.findall(r'[\w.+-]+@[\w-]+\.[\w.-]+', stringed)
+                    for i in found:
+                        if output:
+                            click.secho(f'{i}')
+                            output.write(f'{i}\n')
+                        else:
+                            click.secho(f'{i}')
+            except Exception as e:
+                if verbose:
+                    click.secho(f'[!] Error with entry {entry}: {e}', fg='red', dim=True)
+                continue
     else:
         atoz = [''.join(x) for x in itertools.product(string.ascii_lowercase, repeat=2)]
         for entry in atoz:
-            for names in ResolveNames(account.protocol).call(unresolved_entries=(entry,)):
-                if output:
-                    click.secho(f'{names}')
-                    output.write(f'{names}\n')
-                else:
-                    click.secho(f'{names}')
-
+            try:
+                names_list = safe_resolve_names(account, entry)
+                for names in names_list:
+                    if output:
+                        click.secho(f'{names}')
+                        output.write(f'{names}\n')
+                    else:
+                        click.secho(f'{names}')
+            except Exception as e:
+                if verbose:
+                    click.secho(f'[!] Error with entry {entry}: {e}', fg='red', dim=True)
+                continue
 
     click.secho(f'-------------------------------------\n', dim=True)
-
 
 
 @cli.command(no_args_is_help=True)
@@ -530,36 +579,28 @@ def delegatecheck(email_list, verbose, full_tree, folder):
         Check if the current user has access to the provided mailboxes
         By default will check if access to inbox or not. Can check for other access with --full-tree
     """
-
     if verbose:
         logging.basicConfig(level=logging.DEBUG, handlers=[PrettyXmlHandler()])
 
     credentials = Credentials(tbestate.username, tbestate.password)
 
     try:
-        if tbestate.exch_host:
-            config = Configuration(server=tbestate.exch_host, credentials=credentials)
-            account = Account(tbestate.username, config=config, autodiscover=False)
-        else:
-            account = Account(tbestate.username, credentials=credentials, autodiscover=True)
-
+        account = create_safe_account(tbestate.username, credentials, tbestate.exch_host)
     except exchangelib.errors.ErrorNonExistentMailbox as neb:
-        print(f'[!] Mailbox does not exist for user: {username}')
+        print(f'[!] Mailbox does not exist for user: {tbestate.username}')
         exit()
     except exchangelib.errors.UnauthorizedError as err:
-        print(f'[!] Invalid credentials for user: {username}')
+        print(f'[!] Invalid credentials for user: {tbestate.username}')
         exit()
     except exchangelib.errors.TransportError:
         print(f'[!] Can not reach target Exchange server: {tbestate.exch_host}')
         exit()
     except Exception as err:
         print(f'[!] Something went wrong: {err}')
+        exit()
 
     ews_url = account.protocol.service_endpoint
     ews_auth_type = account.protocol.auth_type
-    # primary_smtp_address = account.primary_smtp_address
-    # This one is optional. It is used as a hint to the initial connection and avoids one or more roundtrips
-    # to guess the correct Exchange server version.
     version = account.version
 
     config = Configuration(service_endpoint=ews_url, credentials=credentials,
@@ -572,9 +613,8 @@ def delegatecheck(email_list, verbose, full_tree, folder):
         try:
             delegate_account = Account(primary_smtp_address=email, config=config,
                                        autodiscover=False, access_type=DELEGATE)
-            # We could also print the full file structure, but you get all the public folders for users.
+            
             if full_tree:
-                # pylint: disable=maybe-no-member
                 click.secho(
                     f'[+] Success {email} - Access to some folders.\n{delegate_account.root.tree()}', fg='green')
             elif folder:
@@ -591,7 +631,6 @@ def delegatecheck(email_list, verbose, full_tree, folder):
                         click.secho(
                             f'[+] Success {email} - Could access {current_folder} - Permissions: {pl}', fg='green')
             else:
-                #delegate_account.inbox
                 pl = []
                 for p in delegate_account.inbox.permission_set.permissions:
                     if p.permission_level != "None":
@@ -609,17 +648,12 @@ def delegatecheck(email_list, verbose, full_tree, folder):
         except exchangelib.errors.ErrorImpersonateUserDenied:
             click.secho(f'[-] {email} - Failure ErrorImpersonateUserDenied', dim=True, fg='red')
 
-
     click.secho(f'-------------------------------------\n', dim=True)
 
 
 @cli.command(no_args_is_help=True)
 @click.option('--userfile', '-U', type=click.Path(exists=True), help='File containing all the user email addresses')
-# @click.option('--passfile', '-P', type=click.Path(exists=True), help='File containing all the passwords to try')
-# @click.option('--username', '-u', help='The user email to try against.')
 @click.option('--password', '-p', help='The password to try against users.')
-# @click.option('--user-agents', type=click.Path(exists=True), help='A list of user agents to randomly choose from per attempt.')
-# @click.option('--jitter', '-j', help='A time range to wait for after every attempt.')
 @click.option('--verbose', '-v', is_flag=True, help='This gives more information.')
 def brute(verbose, userfile, password):
     """
@@ -639,18 +673,9 @@ def brute(verbose, userfile, password):
 
     for username in usernames:
         username = username.strip()
-        # config = Configuration()
         credentials = Credentials(username=username, password=password)
         try:
-            if tbestate.exch_host:
-                config = Configuration(
-                    server=tbestate.exch_host, credentials=credentials)
-                # pylint: disable=unused-variable
-                account = Account(username, config=config, autodiscover=False)
-
-            else:
-                # pylint: disable=unused-variable
-                account = Account(username, credentials=credentials, autodiscover=True)
+            account = create_safe_account(username, credentials, tbestate.exch_host)
             click.secho(
                 f'[+] Success {username}:{password}', fg='green')
         except exchangelib.errors.UnauthorizedError:
@@ -663,5 +688,4 @@ def brute(verbose, userfile, password):
 
 
 if __name__ == '__main__':
-    # pylint: disable=no-value-for-parameter
     cli()
